@@ -11599,3 +11599,36 @@ fn native_typed_buffer_with_wrong_member_shapes_stays_a_mismatch() {
         crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
     );
 }
+
+/// A `<4 x half>` read from the start of a union whose first member is a
+/// `<4 x float>`: the shape a macOS 26 Core Animation fragment shader uses for
+/// the tail union of its uniforms. The bytes read are the first two `float`
+/// lanes, so the load is the leading vector, narrowed to two lanes and bitcast.
+#[test]
+fn native_half4_load_from_the_start_of_a_float4_led_union_is_a_lane_prefix_bitcast() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Inner = type { <4 x float>, <4 x half>, [8 x i8] }
+%Union = type { %Inner, [16 x i8] }
+%Uniform = type { <4 x float>, %Union }
+
+define void @k(ptr addrspace(2) %u, ptr addrspace(1) %out) {
+entry:
+  %field = getelementptr inbounds %Uniform, ptr addrspace(2) %u, i64 0, i32 1
+  %v = load <4 x half>, ptr addrspace(2) %field, align 16
+  store <4 x half> %v, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 80, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 80, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Uniform", !"air.arg_name", !"u"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"out"}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpVectorShuffle"), "{asm}");
+    assert!(asm.contains("OpBitcast"), "{asm}");
+}

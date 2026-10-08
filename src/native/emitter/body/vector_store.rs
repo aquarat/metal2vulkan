@@ -993,7 +993,33 @@ impl Emitter {
                         && bitcast_width(&vector_ty).is_some()
                         && bitcast_width(&vector_ty) == bitcast_width(result_ty)
             );
-        if !direct && !bitcast {
+        // Prefix case: the result reads fewer bits than the leading vector holds, starting at the
+        // vector's first byte -- e.g. `<4 x half>` loaded from the start of a union whose first
+        // member is `<4 x float>`. The bytes read are exactly the leading `k` lanes of that vector
+        // (little-endian, lane 0 at the lowest address), so load the vector, keep `k` lanes, and
+        // bitcast those to the result. Only taken when the result width is a whole number of the
+        // vector's lanes; anything else would read part of a lane and is left to later rungs.
+        let prefix_lanes = if direct || bitcast {
+            None
+        } else {
+            match &vector_ty {
+                LlType::Vector(elem, lanes) => {
+                    match (bitcast_width(elem), bitcast_width(result_ty)) {
+                        (Some(lane_bits), Some(result_bits))
+                            if lane_bits > 0
+                                && result_bits % lane_bits == 0
+                                && result_bits / lane_bits >= 1
+                                && result_bits / lane_bits < *lanes =>
+                        {
+                            Some(((**elem).clone(), result_bits / lane_bits))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        if !direct && !bitcast && prefix_lanes.is_none() {
             return Ok(false);
         }
 
@@ -1019,7 +1045,42 @@ impl Emitter {
         ));
 
         let result_type = self.type_id(result_ty)?;
-        if direct {
+        if let Some((lane_ty, keep)) = prefix_lanes {
+            let vector_type = self.type_id(&vector_ty)?;
+            let loaded = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(vector_type),
+                Some(loaded),
+                vec![Operand::IdRef(vector_ptr)],
+            ));
+            let prefix = self.fresh();
+            if keep == 1 {
+                let lane_type = self.type_id(&lane_ty)?;
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(lane_type),
+                    Some(prefix),
+                    vec![Operand::IdRef(loaded), Operand::LiteralBit32(0)],
+                ));
+            } else {
+                let prefix_type = self.type_id(&LlType::Vector(Box::new(lane_ty), keep))?;
+                let mut ops = vec![Operand::IdRef(loaded), Operand::IdRef(loaded)];
+                ops.extend((0..keep).map(Operand::LiteralBit32));
+                instructions.push(Self::inst(
+                    Op::VectorShuffle,
+                    Some(prefix_type),
+                    Some(prefix),
+                    ops,
+                ));
+            }
+            instructions.push(Self::inst(
+                Op::Bitcast,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(prefix)],
+            ));
+        } else if direct {
             instructions.push(Self::inst(
                 Op::Load,
                 Some(result_type),
