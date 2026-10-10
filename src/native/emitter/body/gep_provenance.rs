@@ -576,6 +576,17 @@ impl Emitter {
             };
         let ptr_type = self.ptr_type_id(access_storage, &access_pointee)?;
         let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+        // Every pointer this path emits is typed `ptr_type`, so when the indexed element is a byte
+        // the emitted pointer genuinely points at `uchar` -- e.g. `gep <{ [12 x i8] }>, %p, %i, 0, 8`,
+        // the shape a Metal vertex-fetch function uses to reach a packed attribute. Its `Int(8)`
+        // pointee is then a fact about the SPIR-V pointer, not the def-time byte placeholder that
+        // `pointer_pointee_for_value` upgrades to the use-implied carrier. Upgrading it made the
+        // load of that attribute (`load <4 x i8>`) an `OpLoad` of `v4uchar` through a `uchar`
+        // pointer. Recording it as a byte view keeps the pointee authoritative, so the load takes
+        // the byte-pointer rungs and assembles its value from the bytes it reads.
+        if access_pointee == LlType::Int(8) {
+            self.byte_view_pointers.insert(name.to_string());
+        }
         // Keystone-1 (general GEP path): base is ALREADY a pointer to the result scalar, but the AIR
         // GEP still carries the aggregate source type + structured multi-index list (the mixed-
         // granularity arm that was GEPed independently before a pointer select, or a follow-up GEP

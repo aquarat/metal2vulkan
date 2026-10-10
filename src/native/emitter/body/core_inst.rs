@@ -2319,6 +2319,12 @@ impl Emitter {
                     if self.unmodeled_pointers.contains(src_name) {
                         self.unmodeled_pointers.insert(name.clone());
                     }
+                    // The alias is the same `uchar` pointer, so it is the same byte view. Without
+                    // this its `Int(8)` pointee reads as the byte placeholder and is upgraded to the
+                    // type it is loaded as, which the pointer does not point at.
+                    if self.byte_view_pointers.contains(src_name) {
+                        self.byte_view_pointers.insert(name.clone());
+                    }
                     if self.param_values.contains(src_name) {
                         self.param_values.insert(name);
                     }

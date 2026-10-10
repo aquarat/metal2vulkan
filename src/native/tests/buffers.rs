@@ -11632,3 +11632,88 @@ entry:
     assert!(asm.contains("OpVectorShuffle"), "{asm}");
     assert!(asm.contains("OpBitcast"), "{asm}");
 }
+
+/// A `<4 x i8>` read from inside a packed byte record, through a GEP that ends on an `i8` of the
+/// record's byte array and a same-address-space pointer alias: the shape a Metal vertex-fetch
+/// function uses for a `uchar4` attribute at byte 8 of a 12-byte stride. The GEP's pointer is a real
+/// `uchar` pointer, so the load must be assembled from the four bytes it reads. Upgrading the
+/// pointer's `Int(8)` pointee to the `<4 x i8>` it is loaded as emitted an `OpLoad %v4uchar`
+/// through `%uchar*`, which the owned-module contract refused.
+#[test]
+fn native_uchar4_load_through_a_byte_record_gep_alias_is_assembled_from_bytes() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %i) {
+entry:
+  %x = zext i32 %i to i64
+  %p = getelementptr <{ [12 x i8] }>, ptr addrspace(1) %in, i64 %x, i32 0, i64 8
+  %q = bitcast ptr addrspace(1) %p to ptr addrspace(1)
+  %v = load <4 x i8>, ptr addrspace(1) %q, align 4
+  %w = bitcast <4 x i8> %v to i32
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"in"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"i"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_uchar4_byte_record_gep_alias_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load translated module");
+    let type_op = |id: Word| {
+        module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(id))
+            .map(|instruction| {
+                (
+                    instruction.class.opcode,
+                    instruction.operands.first().cloned(),
+                )
+            })
+    };
+    let loads = module
+        .all_inst_iter()
+        .filter(|instruction| instruction.class.opcode == Op::Load)
+        .filter_map(|instruction| type_op(instruction.result_type?))
+        .collect::<Vec<_>>();
+    let byte_loads = loads
+        .iter()
+        .filter(|ty| matches!(ty, (Op::TypeInt, Some(Operand::LiteralBit32(8)))))
+        .count();
+    assert_eq!(
+        byte_loads, 4,
+        "the attribute is read a byte at a time:\n{asm}"
+    );
+    let is_byte = |id: &Word| {
+        matches!(
+            type_op(*id),
+            Some((Op::TypeInt, Some(Operand::LiteralBit32(8))))
+        )
+    };
+    assert!(
+        loads
+            .iter()
+            .all(|ty| !matches!(ty, (Op::TypeVector, Some(Operand::IdRef(elem))) if is_byte(elem))),
+        "no byte vector is loaded through a byte pointer:\n{asm}"
+    );
+    assert!(
+        module
+            .all_inst_iter()
+            .any(|instruction| instruction.class.opcode == Op::CompositeConstruct),
+        "the bytes are assembled into the vector:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
